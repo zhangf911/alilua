@@ -17,6 +17,9 @@ extern int ssl_epd_idx;
 
 extern logf_t *ACCESS_LOG;
 
+extern const char *lua_path;
+extern char process_chdir[924];
+
 static int exited = 0;
 static void on_exit_handler()
 {
@@ -200,6 +203,11 @@ int worker_process(epdata_t *epd, int thread_at)
     int is_form_post = 0;
     char *cookies = NULL;
     pt1 = epd->headers;
+
+    if(pt1[0] == '\0') {
+        pt1 = pt1 + 1;
+    }
+
     int i = 0;
 
     epd->uri = NULL;
@@ -219,11 +227,13 @@ int worker_process(epdata_t *epd, int thread_at)
             epd->http_ver = strtok_r(t1, " ", &t1);
 
             if(!epd->http_ver) {
-                return 1;
+                network_send_error(epd, 400, "Bad Request");
+                return 0;
 
             } else {
                 if(init_tables == 0) {
                     lua_createtable(L, 0, 20); //headers
+                    init_tables = 1;
                 }
             }
 
@@ -322,13 +332,15 @@ int worker_process(epdata_t *epd, int thread_at)
         }
     }
 
+    if(init_tables == 0) {
+        network_send_error(epd, 400, "Bad Request");
+        return 0;
+    }
+
     const char *client_ip = cached_ntoa(epd->client_addr);
     lua_pushstring(L, client_ip);
     lua_setfield(L, -2, "remote-addr");
-    int l = sizeof(struct sockaddr);
-    struct sockaddr_in addr;
-    getsockname(epd->fd, (struct sockaddr *) &addr, &l);
-    lua_pushstring(L, cached_ntoa(addr.sin_addr));
+    lua_pushstring(L, cached_ntoa(epd->server_addr));
     lua_setfield(L, -2, "server-addr");
 
     lua_setglobal(L, "headers");
@@ -416,13 +428,10 @@ int worker_process(epdata_t *epd, int thread_at)
 
     lua_setglobal(L, "_COOKIE");
 
-    lua_pushnil(L);
-    lua_setglobal(L, "__body_buf");
-
     epd->vhost_root = get_vhost_root(epd->host, &epd->vhost_root_len);
 
     memcpy(buf_4096, epd->vhost_root, epd->vhost_root_len + 1);
-    sprintf(buf_4096 + epd->vhost_root_len + 1, "?.lua;%s/lua-libs/?.lua;", process_chdir);
+    sprintf(buf_4096 + epd->vhost_root_len + 1, "?.lua;%s/lua-libs/?.lua;%s", process_chdir, lua_path);
 
     lua_pushstring(L, buf_4096);
     lua_getglobal(L, "package");
@@ -443,7 +452,7 @@ int worker_process(epdata_t *epd, int thread_at)
 
     lua_routed = 0;
 
-    if(lua_resume(L, 1) == LUA_ERRRUN) {
+    if(lua_f_lua_uthread_resume_in_c(L, 1) == LUA_ERRRUN) {
         if(lua_isstring(L, -1)) {
             LOGF(ERR, "Lua:error %s", lua_tostring(L, -1));
             network_send_error(epd, 503, lua_tostring(L, -1));
@@ -460,6 +469,8 @@ int worker_process(epdata_t *epd, int thread_at)
 
 static void be_accept(int client_fd, struct in_addr client_addr)
 {
+    int sockaddr_len = sizeof(struct sockaddr);
+    struct sockaddr_in addr;
     /* Disable the Nagle (TCP No Delay) algorithm */
     int flag = 1;
     int ret = setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag));
@@ -491,6 +502,8 @@ static void be_accept(int client_fd, struct in_addr client_addr)
 
     epd->fd = client_fd;
     epd->client_addr = client_addr;
+    getsockname(epd->fd, (struct sockaddr *) &addr, &sockaddr_len);
+    epd->server_addr = addr.sin_addr;
     epd->status = STEP_WAIT;
     epd->content_length = -1;
     epd->keepalive = -1;
